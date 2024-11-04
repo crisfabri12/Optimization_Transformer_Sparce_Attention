@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 
 <div align="center"><img src="figure/logo.png" width="33%"></div>
 
@@ -138,3 +139,6 @@ This project is licensed under the terms of the MIT license.
 <a href="https://github.com/NationalGAILab/HoT/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=NationalGAILab/HoT" />
 </a>
+=======
+# Optimization_Transformer_Sparce_Attention
+>>>>>>> 67fa18dd9a4a1f265244da46ce0ce2ee3d9e4086
