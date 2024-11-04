@@ -9,8 +9,20 @@ def mpjpe(output_3D, out_target):
 
 
 def weighted_mpjpe(predicted, target, w_mpjpe):
-    return torch.mean(w_mpjpe * torch.norm(predicted - target, dim=len(target.shape)-1))
+    # Calcular la diferencia y la norma
+    diff = predicted - target  # [B, F, 17, 3]
+    norm = torch.norm(diff, dim=3)  # [B, F, 17]
 
+    # Ajustar la forma de w_mpjpe para que coincida con 'norm'
+    if w_mpjpe.dim() == 1 and w_mpjpe.size(0) == norm.size(2):
+        w_mpjpe = w_mpjpe.view(1, 1, -1).expand_as(norm)  # [B, F, 17]
+    else:
+        raise ValueError(f"Forma inesperada de 'w_mpjpe': {w_mpjpe.shape}")
+
+    # Calcular la pérdida ponderada
+    loss = torch.mean(w_mpjpe * norm)
+
+    return loss
 
 def temporal_consistency(predicted, target, w_mpjpe):
     dif_seq = predicted[:,1:,:,:] - predicted[:,:-1,:,:]

@@ -17,11 +17,14 @@ from common.camera import *
 import common.loss as eval_loss
 from common.arguments import parse_args
 from common.load_data_hm36 import Fusion
+from thop import profile as thop_profile, clever_format
 from common.h36m_dataset import Human36mDataset
+from thop import profile
 
 args = parse_args()
 
 os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 exec('from model.' + args.model + ' import Model')
 
@@ -108,15 +111,23 @@ if __name__ == '__main__':
     if args.train:
         train_data = Fusion(args, dataset, args.root_path, train=True)
         train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size,
-                            shuffle=True, num_workers=int(args.workers), pin_memory=True)
+                            shuffle=True, num_workers=int(args.workers), pin_memory=False)
     test_data = Fusion(args, dataset, args.root_path, train=False)
     test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size,
-                            shuffle=False, num_workers=int(args.workers), pin_memory=True)
+                            shuffle=False, num_workers=int(args.workers), pin_memory=False)
 
     model = Model(args).cuda()
 
     if args.previous_dir != '':
         Load_model(args, model)
+
+
+    input_data = torch.randn(1, 243, 17, 2).cuda()
+
+    macs, params = profile(model, inputs=(input_data,))  # Calcula FLOPs
+    print(f"FLOPs: {macs / 1e6} M, Parámetros: {params / 1e6} M")
+    macs, params = clever_format([macs*2, params], "%.3f")
+    print(macs, params)
 
     lr = args.lr
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=0.1)

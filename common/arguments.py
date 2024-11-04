@@ -9,13 +9,12 @@ import logging
 
 def parse_args():
     parser = argparse.ArgumentParser()
-
     parser.add_argument('--model', default='', type=str)
     parser.add_argument('--channel', default=512, type=int)
     parser.add_argument('--d_hid', default=1024, type=int)
     parser.add_argument('--frames', type=int, default=243)
     parser.add_argument('--pad', type=int, default=121) 
-    parser.add_argument('--token_num', default=81, type=int)
+    parser.add_argument('--token_num', default=70, type=int)
     parser.add_argument('--layer_index', default=3, type=int)
     parser.add_argument('--dataset', type=str, default='h36m')
     parser.add_argument('--keypoints', default='cpn_ft_h36m_dbb', type=str)
@@ -26,6 +25,7 @@ def parse_args():
     parser.add_argument('--root_path', type=str, default='./dataset/')
     parser.add_argument('--actions', default='*', type=str)
     parser.add_argument('--downsample', default=1, type=int)
+    parser.add_argument('--reduced_frames', type=int, default=81, help='Number of reduced frames after pooling')
     parser.add_argument('--subset', default=1, type=float)
     parser.add_argument('--stride', default=243, type=int)
     parser.add_argument('--gpu', default='0', type=str)
@@ -46,6 +46,8 @@ def parse_args():
     parser.add_argument('--out_channels', type=int, default=3)
     parser.add_argument('--previous_best', type=float, default= math.inf)
     parser.add_argument('--previous_name', type=str, default='')
+    parser.add_argument('--token_num_spatial', type=int, default=8, help='Number of spatial tokens after reduction')
+
 
     args = parser.parse_args()
 

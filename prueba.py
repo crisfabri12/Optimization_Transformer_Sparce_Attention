@@ -193,43 +193,34 @@ class Cross_Attention(nn.Module):
         return x
 
 
-def get_attn_mask(n, attn_mode, local_attn_ctx=None, sparse_stride=2):
+def get_attn_mask(n, attn_mode, local_attn_ctx=None, sparse_stride=3):
     if attn_mode == 'all':
-        b = torch.ones([n, n])
+        b = torch.ones(n, n, device='cuda')
     elif attn_mode == 'local':
-        b = torch.zeros((n, n), dtype=torch.float32)
-        idx = torch.arange(n)
-        # Crear el índice de ventanas desplazadas por el contexto local
-        for i in range(-local_attn_ctx, local_attn_ctx + 1):
-            b += torch.diag(torch.ones(n - abs(i)), i)
+        b = torch.eye(n, device='cuda')
+        for i in range(1, local_attn_ctx + 1):
+            b += torch.diag(torch.ones(n - i, device='cuda'), diagonal=i)
+            b += torch.diag(torch.ones(n - i, device='cuda'), diagonal=-i)
     elif attn_mode == 'strided':
-        b = torch.zeros((n, n), dtype=torch.float32)
-        for i in range(0, n, local_attn_ctx):
-            b[i, :] = 1.0  # Permitir que el frame i atienda a todos los frames
-            b[:, i] = 1.0  # Permitir que todos los frames atiendan al frame i
- 
+        stride = sparse_stride
+        indices = torch.arange(n, device='cuda')
+        mask = (indices.unsqueeze(0) % stride == 0) | (indices.unsqueeze(1) % stride == 0)
+        b = mask.float()
     elif attn_mode == 'dense_sparse':
-        # Crear la matriz de atención
-        b = torch.zeros((n, n), dtype=torch.float32)
-
-        # Agregar atención densa usando ventana local
+        b = torch.zeros(n, n, device='cuda')
+        window = torch.ones(2 * local_attn_ctx + 1, device='cuda')
         for i in range(n):
-            # Ventana local
             start = max(0, i - local_attn_ctx)
             end = min(n, i + local_attn_ctx + 1)
-            b[i, start:end] = 1.0  # Atención densa
-
-        # Agregar atención escasa
-        if sparse_stride is not None:
-            for i in range(0, n, sparse_stride):
-                b[i, :] = 1.0  # Permitir que el frame i atienda a todos los frames
-                b[:, i] = 1.0  # Permitir que todos los frames atiendan al frame i
-
+            b[i, start:end] = window[:end - start]
+        if sparse_stride:
+            stride_indices = torch.arange(0, n, sparse_stride, device='cuda')
+            b[stride_indices, :] = 1.0
+            b[:, stride_indices] = 1.0
     else:
         raise ValueError('Not yet implemented')
-    
-    b = torch.reshape(b, [1, 1, n, n])
-    return b
+    return b.unsqueeze(0).unsqueeze(0)  # Shape [1, 1, n, n]
+
 
 
 def strided_transpose(x, n_ctx, local_attn_ctx, blocksize):
@@ -296,74 +287,46 @@ def merge_states(x):
     new_x_shape = x_shape[:-2] + (np.prod(x_shape[-2:]))
     return torch.reshape(x, new_x_shape)
 
-def attention_impl(q, k, v, heads, attn_mode, local_attn_ctx=None):
-    q = split_heads(q, heads)
-    k = split_heads(k, heads)
-    v = split_heads(v, heads)
-    n_timesteps = k.size()[2]
-    mask = get_attn_mask(n_timesteps, attn_mode, local_attn_ctx).float()
-    
-    # Mover el mask a la misma GPU que los tensores q y k
-    mask = mask.to(q.device)
-
-    w = torch.matmul(q, k.transpose(-2, -1))
-    scale_amount = 1.0 / np.sqrt(q.size()[-1])
-    w = w * scale_amount
-    w = w * mask + -1e9 * (1 - mask)
+def attention_all(q, k, v, scale, mask):
+    w = torch.matmul(q, k.transpose(-2, -1)) * scale
+    w = w.masked_fill(mask == 0, -1e9)
     w = F.softmax(w, dim=-1)
     a = torch.matmul(w, v)
+    return a, w  # Retornamos también los pesos de atención
+
+def attention_strided(q, k, v, scale, stride):
+    batch_size, num_heads, seq_length, head_dim = q.size()
+    
+    # Seleccionar posiciones strided para keys y values
+    k_strided = k[:, :, ::stride, :]  # (batch, heads, seq_length // stride, head_dim)
+    v_strided = v[:, :, ::stride, :]  # (batch, heads, seq_length // stride, head_dim)
+    
+    # Multiplicación de matrices con las posiciones strided
+    w = torch.matmul(q, k_strided.transpose(-2, -1)) * scale  # (batch, heads, seq_length, seq_length // stride)
+    w = F.softmax(w, dim=-1)
+    a = torch.matmul(w, v_strided)  # (batch, heads, seq_length, head_dim)
+    
+    return a, w  # Retornamos también los pesos de atención
+
+def attention_impl(q, k, v, heads, attn_mode, local_attn_ctx=None):
+    q = split_heads(q, heads).contiguous()
+    k = split_heads(k, heads).contiguous()
+    v = split_heads(v, heads).contiguous()
+    
+    scale = 1.0 / np.sqrt(q.size(-1))
+    
+    if attn_mode == 'all':
+        mask = get_attn_mask(k.size(2), attn_mode, local_attn_ctx).float().to(q.device)
+        a, w = attention_all(q, k, v, scale, mask)
+    elif attn_mode == 'strided':
+        stride = local_attn_ctx  # Define un stride desde local_attn_ctx
+        a, w = attention_strided(q, k, v, scale, stride)
+    else:
+        raise ValueError(f"Unsupported attention mode: {attn_mode}")
+    
     a = merge_heads(a)
-    return a
-
-
-# def blocksparse_attention_impl(q, k, v, heads, attn_mode, local_attn_ctx=None, blocksize=64, num_verts=None, vertsize=None):
-#     n_ctx = q.size()[1]
-    
-#     # Imprimir las entradas
-#     #print(f"Input Q shape: {q.shape}, K shape: {k.shape}, V shape: {v.shape}")
-    
-#     if attn_mode == 'strided':
-#         q = strided_transpose(q, n_ctx, local_attn_ctx, blocksize)
-#         k = strided_transpose(k, n_ctx, local_attn_ctx, blocksize)
-#         v = strided_transpose(v, n_ctx, local_attn_ctx, blocksize)
-
-#     # Imprimir después del strided_transpose
-#     #print(f"Strided Q shape: {q.shape}, K shape: {k.shape}, V shape: {v.shape}")
-    
-#     n_state = q.size()[-1] // heads
-#     scale_amount = 1.0 / np.sqrt(n_state)
-    
-#     # Imprimir el escalamiento
-#     #print(f"Scale amount: {scale_amount}")
-    
-#     # Matriz de atención
-#     w = torch.matmul(q, k.transpose(-2, -1))
-    
-#     # Imprimir matriz de atención antes de softmax
-#     #print(f"Attention Weights shape: {w.shape}, Attention Weights (before softmax): {w}")
-    
-#     w = F.softmax(w * scale_amount, dim=-1)
-    
-#     # Imprimir matriz de atención después de softmax
-#     #print(f"Attention Weights (after softmax): {w}")
-    
-#     a = torch.matmul(w, v)#
-    
-#     # Imprimir la salida de la atención
-#     #print(f"Attention Output shape: {a.shape}, Attention Output: {a}")
-    
-#     if attn_mode == 'strided':
-#         n, t, embd = a.size()
-#         bT_ctx = n_ctx // local_attn_ctx
-#         a = torch.reshape(a, [n, local_attn_ctx, bT_ctx, embd])
-#         a = torch.permute(a, (0, 2, 1, 3))
-#         a = torch.reshape(a, [n, t, embd])
-    
-#     # Imprimir la salida final de la atención
-#     #print(f"Final Attention Output shape: {a.shape}, Final Attention Output: {a}")
-    
-#     return a
-
+    w = w.view(q.size(0), heads, q.size(2), -1)  # Ajustar dimensiones si es necesario
+    return a, w 
 
 class SparseAttention(nn.Module):
     def __init__(self, heads, attn_mode, local_attn_ctx=None, blocksize=17):
@@ -374,40 +337,32 @@ class SparseAttention(nn.Module):
         self.blocksize = blocksize
 
     def forward(self, q, k, v):
-        return attention_impl(q, k, v, self.heads, self.attn_mode, self.local_attn_ctx)
+        attn_output, attn_weights = attention_impl(q, k, v, self.heads, self.attn_mode, self.local_attn_ctx)
+        return attn_output, attn_weights 
 
 
 class Block(nn.Module):
     def __init__(self, dim, num_heads, mlp_hidden_dim, qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
-                drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, depth=0, type = 'spatial'):
+                drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, depth=0):
         super().__init__()
 
-        self.type = type 
         self.norm1 = norm_layer(dim)
         self.attn = SparseAttention(
                 heads=num_heads, 
-                local_attn_ctx = 2,
+                local_attn_ctx = 3,
                 attn_mode='strided', 
             )
-
-        self.attn2 = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias, \
-            qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
 
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
         
     def forward(self, x):
-        if self.type  == 'spatial': 
-            attn_output = self.attn2(self.norm1(x))
-        elif self.type  == 'temporal': 
-            q = k = v = self.norm1(x)
-            attn_output = self.attn(q, k, v)
-        
+        q = k = v = self.norm1(x)
+        attn_output, attn_weights = self.attn(q, k, v)  # Capturamos los pesos de atención
         x = x + self.drop_path(attn_output)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
-        
-        return x
+        return x, attn_weights
 
 
 class Model(nn.Module):
@@ -450,13 +405,13 @@ class Model(nn.Module):
         self.STEblocks = nn.ModuleList([
             Block(
                 dim=embed_dim, num_heads=num_heads, mlp_hidden_dim=mlp_hidden_dim, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, type = 'spatial')
+                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer)
             for i in range(depth)])
 
         self.TTEblocks = nn.ModuleList([
             Block(
                 dim=embed_dim, num_heads=num_heads, mlp_hidden_dim=mlp_hidden_dim, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, depth=depth, type = 'temporal')
+                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, depth=depth)
             for i in range(depth)])
 
         self.x_token = nn.Parameter(torch.zeros(1, self.recover_num, embed_dim))
@@ -474,18 +429,21 @@ class Model(nn.Module):
 
     def forward(self, x):
         b, f, n, c = x.shape
+        attn_weights_all = []
 
         x = rearrange(x, 'b f n c  -> (b f) n c')
         x = self.Spatial_patch_to_embedding(x)
         x += self.Spatial_pos_embed
         x = self.pos_drop(x)
-        x = self.STEblocks[0](x)
+        x, attn_weights = self.STEblocks[0](x)
+        attn_weights_all.append(attn_weights.detach().cpu())
         x = self.Spatial_norm(x)
 
         x = rearrange(x, '(b f) n c -> (b n) f c', f=f)
         x += self.Temporal_pos_embed
         x = self.pos_drop(x)
-        x = self.TTEblocks[0](x)
+        x, attn_weights = self.TTEblocks[0](x)
+        attn_weights_all.append(attn_weights.detach().cpu())
         x = self.Temporal_norm(x)
 
         x = rearrange(x, '(b n) f c -> b f n c', n=n)
@@ -512,11 +470,13 @@ class Model(nn.Module):
             steblock = self.STEblocks[i]
             tteblock = self.TTEblocks[i]
             
-            x = steblock(x)
+            x, attn_weights = steblock(x)
+            attn_weights_all.append(attn_weights.detach().cpu())
             x = self.Spatial_norm(x)
             x = rearrange(x, '(b f) n c -> (b n) f c', b=b)
 
-            x = tteblock(x)
+            x, attn_weights = tteblock(x)
+            attn_weights_all.append(attn_weights.detach().cpu())
             x = self.Temporal_norm(x)
             x = rearrange(x, '(b n) f c -> b f n c', n=n)
 
@@ -529,7 +489,8 @@ class Model(nn.Module):
 
         x = x.view(b, -1, n, 3)
 
-        return x
+        return x, attn_weights_all  
+
 import torch.profiler
 if __name__ == '__main__':
     import argparse
@@ -555,66 +516,87 @@ if __name__ == '__main__':
         torch.profiler.ProfilerActivity.CPU,
         torch.profiler.ProfilerActivity.CUDA],  # CUDA si estás usando GPU
         ) as prof:
-            output = model(input_2d)
+            output, attn_weights_all = model(input_2d)
 
+    import matplotlib.pyplot as plt
+
+    # Ejemplo: Visualizar los pesos de atención del primer bloque y primera cabeza
+    if len(attn_weights_all) > 0:
+        # Supongamos que quieres visualizar la atención del primer bloque
+        block_index = 5  # Ajusta según el bloque que deseas visualizar
+        attn_weights = attn_weights_all[block_index]  # [batch, heads, seq_length, seq_length]
+
+        # Seleccionar una muestra y una cabeza
+        sample = attn_weights[0, 0].numpy()  # Primera muestra, primera cabeza
+
+        plt.figure(figsize=(10, 20))
+        plt.imshow(sample, cmap='viridis')
+        plt.title(f'Pesos de Atención - Bloque {block_index}, Cabeza 0')
+        plt.colorbar()
+        plt.xlabel('Posiciones de Keys')
+        plt.ylabel('Posiciones de Queries')
+        plt.show()
+    else:
+        print("No se han capturado pesos de atención.")
+        
     print(prof.key_averages().table(sort_by="cpu_time_total"))
 
     from thop import profile
     from thop import clever_format
     from fvcore.nn import FlopCountAnalysis
     import time
-    import matplotlib.pyplot as plt
+    
     
     flops = FlopCountAnalysis(model, input_2d)
     print("Total FLOPs: ", flops.total())
 
 
-    block = model.STEblocks[3]
-    attention = model.STEblocks[3].attn
-    x = rearrange(input_2d, 'b f n c  -> (b f) n c')
-    x = model.Spatial_patch_to_embedding(x)
-    x += model.Spatial_pos_embed
-    x = model.pos_drop(x)
-    q = k = v = block.norm1(x)
-    _ = attention(q, k, v)  # Asumiendo que attention_impl es tu función
+    # block = model.STEblocks[3]
+    # attention = model.STEblocks[3].attn
+    # x = rearrange(input_2d, 'b f n c  -> (b f) n c')
+    # x = model.Spatial_patch_to_embedding(x)
+    # x += model.Spatial_pos_embed
+    # x = model.pos_drop(x)
+    # q = k = v = block.norm1(x)
+    # _ = attention(q, k, v)  # Asumiendo que attention_impl es tu función
 
 
 
-    def calculate_flops_for_mask(mask, d):
-        # mask tiene dimensiones [n, n] y cada entrada es 0 o 1
-        # d es la dimensión de cada vector de características por cabeza
-        active_elements = mask.sum().item()  # Cuenta cuántos 1s hay en la máscara
-        flops_per_element = 2 * d - 1  # Multiplicaciones y sumas por elemento en el producto punto
-        total_flops = flops_per_element * active_elements
-        return total_flops
+    # def calculate_flops_for_mask(mask, d):
+    #     # mask tiene dimensiones [n, n] y cada entrada es 0 o 1
+    #     # d es la dimensión de cada vector de características por cabeza
+    #     active_elements = mask.sum().item()  # Cuenta cuántos 1s hay en la máscara
+    #     flops_per_element = 2 * d - 1  # Multiplicaciones y sumas por elemento en el producto punto
+    #     total_flops = flops_per_element * active_elements
+    #     return total_flops
 
 
-    n_timesteps = k.size()[2]
-    mask = get_attn_mask(n_timesteps, 'dense_sparse', 2).float()
-    mask2 = get_attn_mask(n_timesteps, 'local', 2).float()
-    mask3 = get_attn_mask(n_timesteps, 'all', 2).float()
-    mask4 = get_attn_mask(n_timesteps, 'strided', 2).float()
-    d = 512  # Dimensiones por cabeza
-    flops = calculate_flops_for_mask(mask, d)
-    flops2 = calculate_flops_for_mask(mask2, d)
-    flops3 = calculate_flops_for_mask(mask3, d)
-    flops4 = calculate_flops_for_mask(mask4, d)
-    print(f"Total FLOPs for dense_sparse attention with context 3: {flops}")
-    print(f"Total FLOPs for local attention with context 3: {flops2}")
-    print(f"Total FLOPs for all attention with context 3: {flops3}")
-    print(f"Total FLOPs for strided attention with context 3: {flops4}")
+    # n_timesteps = k.size()[2]
+    # mask = get_attn_mask(n_timesteps, 'dense_sparse', 2).float()
+    # mask2 = get_attn_mask(n_timesteps, 'local', 2).float()
+    # mask3 = get_attn_mask(n_timesteps, 'all', 2).float()
+    # mask4 = get_attn_mask(n_timesteps, 'strided', 2).float()
+    # d = 512  # Dimensiones por cabeza
+    # flops = calculate_flops_for_mask(mask, d)
+    # flops2 = calculate_flops_for_mask(mask2, d)
+    # flops3 = calculate_flops_for_mask(mask3, d)
+    # flops4 = calculate_flops_for_mask(mask4, d)
+    # print(f"Total FLOPs for dense_sparse attention with context 3: {flops}")
+    # print(f"Total FLOPs for local attention with context 3: {flops2}")
+    # print(f"Total FLOPs for all attention with context 3: {flops3}")
+    # print(f"Total FLOPs for strided attention with context 3: {flops4}")
 
-    modes = ['local', 'strided', 'all']
-    for mode in modes:
-            mask = get_attn_mask(n_timesteps, mode, 5).float()
-            mask = mask.squeeze()  # Reduce las dimensiones adicionales
-            plt.figure(figsize=(8, 6))
-            plt.imshow(mask.cpu().numpy(), cmap='viridis', aspect='auto')
-            plt.title(f'Attention Mask for Mode: {mode}')
-            plt.colorbar()
-            plt.xlabel('Key Positions')
-            plt.ylabel('Query Positions')
-            plt.show()
+    # modes = ['local', 'strided', 'all','dense_sparse']
+    # for mode in modes:
+    #         mask = get_attn_mask(n_timesteps, mode, 5).float()
+    #         mask = mask.squeeze()  # Reduce las dimensiones adicionales
+    #         plt.figure(figsize=(8, 6))
+    #         plt.imshow(mask.cpu().numpy(), cmap='viridis', aspect='auto')
+    #         plt.title(f'Attention Mask for Mode: {mode}')
+    #         plt.colorbar()
+    #         plt.xlabel('Key Positions')
+    #         plt.ylabel('Query Positions')
+    #         plt.show()
 
 
 

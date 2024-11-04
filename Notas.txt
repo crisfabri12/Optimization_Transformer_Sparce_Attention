@@ -1,0 +1,16 @@
+Clustering espectrales 
+
+stride-local => local=2, stride= 2, tokens=80
+160, lr: 0.000008, l: 0.1222, p1: 55.71, p2: 43.17, 140: 55.71
+
+triangulo inferior 
+160, lr: 0.000008, l: 0.1222, p1: 54.24, p2: 43.17, 140: 54.20
+
+stride-local => local=3, stride= 2, tokens=100
+160, lr: 0.000008, l: 0.1290, p1: 57.56, p2: 44.70, 155: 56.49
+
+
+
+https://github.com/Vegetebird/StridedTransformer-Pose3D/blob/main/model/strided_transformer.py
+
+

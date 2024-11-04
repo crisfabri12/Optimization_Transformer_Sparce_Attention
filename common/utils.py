@@ -7,6 +7,21 @@ import hashlib
 import glob
 import torch.nn as nn
 from einops import rearrange, repeat
+import torch.nn.functional as F
+
+import torch.nn.functional as F
+
+def adjust_to_target_shape(predicted, target):
+    # Reorganiza el tensor para que la dimensión de los frames (T) esté al final
+    predicted = predicted.permute(0, 2, 3, 1)  # Cambia de [B, T, N, C] a [B, N, C, T]
+    
+    # Aplica interpolación en la dimensión de los frames
+    predicted_resized = F.interpolate(predicted, size=target.shape[1], mode='linear', align_corners=False)
+    
+    # Vuelve a reorganizar el tensor a la forma original [B, T, N, C]
+    predicted_resized = predicted_resized.permute(0, 3, 1, 2)  # Cambia de [B, N, C, T] a [B, T, N, C]
+    
+    return predicted_resized
 
 
 def test_calculation(predicted, target, action, error_sum, data_type, subject):
@@ -198,5 +213,5 @@ def Load_model(args, model):
 
     state_dict = {k: v for k, v in pre_dict.items() if k in model_dict.keys()}
     model_dict.update(state_dict)
-    model.load_state_dict(model_dict)
+    model.load_state_dict(model_dict,strict=False)
 
